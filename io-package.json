@@ -88,6 +88,9 @@
     "adminUI": {
       "config": "json"
     },
+        "supportedMessages": {
+            "deviceManager": true
+        },
     "compact": true,
     "licenseInformation": {
       "type": "free",
@@ -113,7 +116,7 @@
     "dataSource": "push",
     "globalDependencies": [
       {
-        "admin": ">=7.6.20"
+                "admin": ">=7.8.20"
       }
     ],
     "dependencies": [

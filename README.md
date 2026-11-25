@@ -15,15 +15,15 @@ A small excerpt just of the command options:
 
 ![möglichkeiten](https://github.com/arteck/iobroker.judoisoft/blob/master/doku/datenpunkte.png)
 
-Settings available:
+### Configure devices
 
-![möglichkeiten](https://github.com/arteck/iobroker.judoisoft/blob/master/doku/settings.png)
+Existing installations keep their settings in the **Default device** tab. That device's IDs stay at the instance root, for example `judoisoft.0.Date` in REST API mode.
 
-For devices with the new JUDO connectivity module, enable `REST API (connectivity module)` in instance settings.
-This uses the local interface `http://<ip>/api/rest/...` (Basic Auth).
-(default username/password is 'admin' / 'Connectivity')
+With the instance running, open **Devices** and choose **Add device**. Set a stable device ID, such as `workshop`, to create objects like `judoisoft.0.workshop.Date`. You can edit the device settings and display name in Device Manager. Device Manager requires ioBroker Admin 7.8.20 or newer.
 
-Cloud login takes precedence: when it is enabled, the REST API option is hidden and ignored.
+Each device has its own polling interval and credentials. For a local device, enter its IP address or host name. Enable **REST API** for the new JUDO connectivity module, which uses Basic Auth at `http://<ip>/api/rest/...` and defaults to `admin` / `Connectivity`. For cloud devices, enable **Cloud login** and enter the zero-based device index in your cloud account. Cloud login takes precedence when both options are enabled.
+
+`judoisoft.0.info.connection` follows the default device when configured. Otherwise, it reports whether any device is connected. Each additional device reports its own connection at `judoisoft.0.<device>.info.connection`.
 
 ## Changelog
 ### 1.1.7 (2026-09-09)

@@ -6,6 +6,12 @@ export default [
     {
         ignores: ['.dev-server/**'],
     },
+    {
+        files: ['**/*.js'],
+        rules: {
+            'jsdoc/check-tag-names': ['warn', { typed: false }],
+        },
+    },
 
     // Add mocha globals for test files
     {

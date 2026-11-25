@@ -1,85 +1,109 @@
 {
     "i18n": true,
-    "type": "panel",
+    "type": "tabs",
     "items": {
-        "_settingsHeader": {
-            "type": "header",
-            "text": "settings_header",
-            "size": 2
+        "_defaultDevice": {
+            "type": "panel",
+            "label": {
+                "en": "Default device",
+                "de": "Standardgerät"
+            },
+            "items": {
+                "cloud": {
+                    "type": "checkbox",
+                    "label": "cloud_label",
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 6,
+                    "lg": 4,
+                    "xl": 4,
+                    "newLine": true
+                },
+                "ip": {
+                    "type": "text",
+                    "label": "ip_label",
+                    "hidden": "data.cloud",
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 6,
+                    "lg": 4,
+                    "xl": 4
+                },
+                "restApi": {
+                    "type": "checkbox",
+                    "label": "restapi_label",
+                    "hidden": "data.cloud",
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 6,
+                    "lg": 4,
+                    "xl": 4
+                },
+                "deviceIndex": {
+                    "type": "number",
+                    "label": "deviceIndex_label",
+                    "tooltip": "deviceIndex_tooltip",
+                    "hidden": "!data.cloud",
+                    "min": 0,
+                    "step": 1,
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 6,
+                    "lg": 4,
+                    "xl": 4
+                },
+                "interval": {
+                    "type": "number",
+                    "label": "interval_label",
+                    "min": 1,
+                    "step": 1,
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 6,
+                    "lg": 4,
+                    "xl": 4,
+                    "newLine": true
+                },
+                "user": {
+                    "type": "text",
+                    "label": "user_label",
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 6,
+                    "lg": 4,
+                    "xl": 4,
+                    "newLine": true
+                },
+                "password": {
+                    "type": "password",
+                    "label": "password_label",
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 6,
+                    "lg": 4,
+                    "xl": 4
+                }
+            }
         },
-        "cloud": {
-            "type": "checkbox",
-            "label": "cloud_label",
-            "xs": 12,
-            "sm": 12,
-            "md": 6,
-            "lg": 4,
-            "xl": 4,
-            "newLine": true
-        },
-        "ip": {
-            "type": "text",
-            "label": "ip_label",
-            "hidden": "data.cloud",
-            "xs": 12,
-            "sm": 12,
-            "md": 6,
-            "lg": 4,
-            "xl": 4
-        },
-        "restApi": {
-            "type": "checkbox",
-            "label": "restapi_label",
-            "hidden": "data.cloud",
-            "xs": 12,
-            "sm": 12,
-            "md": 6,
-            "lg": 4,
-            "xl": 4
-        },
-        "deviceIndex": {
-            "type": "number",
-            "label": "deviceIndex_label",
-            "tooltip": "deviceIndex_tooltip",
-            "hidden": "!data.cloud",
-            "min": 0,
-            "step": 1,
-            "xs": 12,
-            "sm": 12,
-            "md": 6,
-            "lg": 4,
-            "xl": 4
-        },
-        "interval": {
-            "type": "number",
-            "label": "interval_label",
-            "min": 1,
-            "step": 1,
-            "xs": 12,
-            "sm": 12,
-            "md": 6,
-            "lg": 4,
-            "xl": 4,
-            "newLine": true
-        },
-        "user": {
-            "type": "text",
-            "label": "user_label",
-            "xs": 12,
-            "sm": 12,
-            "md": 6,
-            "lg": 4,
-            "xl": 4,
-            "newLine": true
-        },
-        "password": {
-            "type": "password",
-            "label": "password_label",
-            "xs": 12,
-            "sm": 12,
-            "md": 6,
-            "lg": 4,
-            "xl": 4
+        "_devices": {
+            "type": "panel",
+            "label": "Devices",
+            "style": {
+                "width": "100%",
+                "height": "100%",
+                "overflow": "hidden"
+            },
+            "items": {
+                "_deviceManager": {
+                    "type": "deviceManager",
+                    "sm": 12,
+                    "style": {
+                        "width": "100%",
+                        "height": "100%",
+                        "overflow": "hidden"
+                    }
+                }
+            }
         }
     }
 }

@@ -1,1776 +1,234 @@
 'use strict';
 
-const judoConv = require('./lib/dataConverter');
-const restData = require('./lib/restData');
 const utils = require('@iobroker/adapter-core');
-const axios = require('axios');
-const https = require('node:https');
-const md5 = require('md5');
+const { COMMANDS, DEFAULT_DEVICE_ID, JudoDevice } = require('./lib/judoDevice');
+const JudoDeviceManagement = require('./lib/deviceManagement');
+const defaults = require('./io-package.json').native;
 
-let _interval = 0;
-let _requestInterval = null;
-let _requestTimeout = null;
+/** @typedef {import('./lib/judoDevice').DeviceConfig} DeviceConfig */
 
-axios.defaults.timeout = 1000 * 60; // timeout 60 sec
+// New device IDs use lowercase characters. Reserve the legacy lowercase root IDs and the default device ID.
+const RESERVED_IDS = new Set([DEFAULT_DEVICE_ID, 'info', 'token']);
 
-// At request level
-const agent = new https.Agent({
-    rejectUnauthorized: false,
-});
-const options = {
-    url: '',
-    method: 'GET',
-    httpsAgent: agent,
-    headers: {
-        'user-agent': 'Mozilla',
-    },
-    data: {},
-};
-
-let baseUrl = '';
-let _tokenData;
-let _pauseValveState = false;
-let _pauseStandBy = false;
-let _serialnumber;
-let _da;
-let _dt;
-let wtuType = -1;
-
-class judoisoftControll extends utils.Adapter {
-    /**
-     * @param {Partial<utils.AdapterOptions>} [options] - Adapter initialization options.
-     */
+class Judoisoft extends utils.Adapter {
+    /** @param {Partial<utils.AdapterOptions>} [options] - Adapter initialization options. */
     constructor(options) {
-        super({
-            ...options,
-            name: 'judoisoft',
+        super({ ...options, name: 'judoisoft' });
+        /** @type {Map<string, JudoDevice>} */
+        this.devices = new Map();
+        this.deviceChanges = Promise.resolve();
+        this.unloading = false;
+        /** @type {Promise<void>} */
+        this.devicesLoaded = new Promise(resolve => {
+            this.once('ready', () => {
+                void this.onReady()
+                    .catch(() => this.log.error('Could not load the JUDO device configuration'))
+                    .finally(resolve);
+            });
         });
-        this.on('ready', this.onReady.bind(this));
-        //this.on('objectChange', this.onObjectChange.bind(this));
+        new JudoDeviceManagement(this);
         this.on('stateChange', this.onStateChange.bind(this));
-        //  this.on('message', this.onMessage.bind(this));
         this.on('unload', this.onUnload.bind(this));
     }
 
-    /**
-     * Is called when databases are connected and adapter received configuration.
-     */
     async onReady() {
-        this.setState('info.connection', false, true);
-
-        await this.initialization();
-        await this.create_state();
-
-        if (this.isRestApiMode()) {
-            await this.getInfoStaticLocalRest();
-            this.getInfosLocalRest();
-        } else if (this.isCloudMode()) {
-            if (this.config.restApi) {
-                this.log.info('Cloud is enabled; REST API is ignored');
-            }
-            _tokenData = await this.getTokenFirst();
-            this.getInfosCloud();
-        } else {
-            _tokenData = await this.getTokenFirst();
-            await this.getInfoStaticLocal();
-            this.getInfosLocal();
+        await this.setStateAsync('info.connection', false, true);
+        await this.subscribeStatesAsync(COMMANDS.flatMap(command => [command, `*.${command}`]));
+        const legacyIp = this.config.ipaddress?.trim();
+        const ip = this.config.ip?.trim() || (legacyIp === defaults.ipaddress ? '' : legacyIp) || '';
+        if (this.config.cloud || ip) {
+            await this.startDevice(DEFAULT_DEVICE_ID, 'Default device', { ...defaults, ...this.config, ip });
         }
+
+        const devices = await this.getDevicesAsync();
+        await Promise.all(
+            devices.map(async object => {
+                const id = object._id.slice(this.namespace.length + 1);
+                const stored = object.native.judoisoft;
+                if (!stored || !this.isDeviceId(id)) {
+                    return;
+                }
+                try {
+                    const config = { ...stored, password: stored.password ? this.decrypt(stored.password) : '' };
+                    await this.startDevice(id, object.common.name || id, config);
+                } catch {
+                    this.log.error(`[${id}] Could not load the device settings`);
+                }
+            }),
+        );
     }
 
-    /**
-     * Is called when adapter shuts down - callback has to be called under any circumstances!
-     *
-     * @param {() => void} callback - Callback to finalize adapter shutdown.
-     */
+    /** @param {() => void} callback - Completes adapter shutdown. */
     onUnload(callback) {
-        try {
-            if (_requestInterval) {
-                this.clearInterval(_requestInterval);
-                _requestInterval = null;
-            }
-            if (_requestTimeout) {
-                this.clearTimeout(_requestTimeout);
-                _requestTimeout = null;
-            }
-            this.log.info('cleaned everything up...');
-            this.setState('info.connection', false, true);
-            callback();
-        } catch {
-            callback();
-        }
+        this.unloading = true;
+        void this.shutdown()
+            .catch(() => this.log.error('Could not clear connection states on shutdown'))
+            .finally(callback);
+    }
+
+    async shutdown() {
+        await Promise.all([...this.devices.values()].map(device => device.stop()));
+        await this.deviceChanges;
+        await Promise.all([
+            this.setStateAsync('info.connection', false, true),
+            ...[...this.devices.values()]
+                .filter(device => device.id !== DEFAULT_DEVICE_ID)
+                .map(device => this.setStateAsync(device.connectionId, false, true)),
+        ]);
     }
 
     /**
-     * Is called if a subscribed state changes
+     * Routes writes by the full state ID so identical command names can be used on different devices.
      *
      * @param {string} id - Full state ID.
-     * @param {ioBroker.State | null | undefined} state - New state object or `null`/`undefined` when deleted.
+     * @param {ioBroker.State | null | undefined} state - New state, or null when deleted.
      */
     onStateChange(id, state) {
-        if (state) {
-            this.log.debug(`--> stateID ${id} changed: ${state.val} (ack = ${state.ack})`);
-
-            const tmp = id.split('.');
-            const command = tmp.pop();
-
-            if (state && !state.ack) {
-                if (this.isRestApiMode()) {
-                    this.setCommandStateLocalRest(command, state.val);
-                } else if (this.isCloudMode()) {
-                    this.setCommandStateCloud(command, state.val);
-                } else {
-                    this.setCommandStateLocal(command, state.val);
-                }
-            }
-        } else {
-            // The state was deleted
-            this.log.info(`state ${id} deleted`);
+        if (!state || state.ack || this.unloading || !id.startsWith(`${this.namespace}.`)) {
+            return;
+        }
+        const relativeId = id.slice(this.namespace.length + 1);
+        const separator = relativeId.indexOf('.');
+        const device = this.devices.get(separator === -1 ? DEFAULT_DEVICE_ID : relativeId.slice(0, separator));
+        const command = relativeId.slice(separator + 1);
+        if (device?.stateId(command) === relativeId) {
+            void device.handleCommand(command, state.val);
         }
     }
 
-    isCloudMode() {
-        return !!this.config.cloud;
-    }
-
-    isRestApiMode() {
-        return !!this.config.restApi && !this.isCloudMode();
-    }
-
-    async setConnected(connected) {
-        await this.setState('info.connection', !!connected, true);
-    }
-
-    ensurePollInterval(pollFn) {
-        if (!_requestInterval) {
-            _requestInterval = this.setInterval(async () => {
-                await pollFn.call(this);
-            }, _interval);
+    async updateConnection() {
+        if (!this.unloading) {
+            const defaultDevice = this.devices.get(DEFAULT_DEVICE_ID);
+            const connected = defaultDevice?.connected ?? [...this.devices.values()].some(device => device.connected);
+            await this.setStateAsync('info.connection', connected, true);
         }
     }
 
-    async getInfoStaticLocal() {
-        this.log.debug('get Information Static Local');
+    /** @param {string} id - Candidate for a device's root object ID. */
+    isDeviceId(id) {
+        return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id) && !RESERVED_IDS.has(id);
+    }
+
+    /**
+     * @param {string} id - Stable device identifier.
+     * @param {ioBroker.StringOrTranslated} name - Display name.
+     * @param {DeviceConfig} config - Connection settings.
+     */
+    async startDevice(id, name, config) {
+        if (this.unloading) {
+            return;
+        }
+        const device = new JudoDevice(this, id, typeof name === 'string' ? name : name.en, config, () =>
+            this.updateConnection(),
+        );
+        this.devices.set(id, device);
         try {
-            const soft = await this.getAxiosData(
-                `${baseUrl}version&command=software%20version&msgnumber=1&token=${_tokenData}`,
-            ); //SoftwareVersion
-            this.setState('SoftwareVersion', soft.data.data, true);
-        } catch {
-            this.log.error('SoftwareVersion ERROR ');
-        }
-
-        try {
-            const hard = await this.getAxiosData(
-                `${baseUrl}version&command=hardware%20version&msgnumber=1&token=${_tokenData}`,
-            ); //HardwareVersion
-            this.setState('HardwareVersion', hard.data.data, true);
-        } catch {
-            this.log.error('HardwareVersion ERROR ');
-        }
-
-        try {
-            const instDat = await this.getAxiosData(
-                `${baseUrl}contract&command=init%20date&msgnumber=1&token=${_tokenData}`,
-            ); //InstallationDate
-            const inst = new Date(Number(instDat.data.data) * 1000);
-            this.setState('InstallationDate', inst, true);
-        } catch {
-            this.log.error('InstallationDate ERROR ');
-        }
-
-        try {
-            const servDat = await this.getAxiosData(
-                `${baseUrl}contract&command=service%20date&msgnumber=1&token=${_tokenData}`,
-            ); //ServiceDate
-            const serv = new Date(Number(servDat.data.data) * 1000);
-            this.setState('ServiceDate', serv, true);
-        } catch {
-            this.log.error('ServiceDate ERROR ');
-        }
-    }
-
-    async getInfosCloud() {
-        this.log.debug('get Consumption data Cloud');
-
-        try {
-            let conResult = await this.getAxiosData(
-                `${baseUrl}?token=${_tokenData}&group=register&command=get%20device%20data`,
-            );
-
-            //    this.log.debug("RAW : " + JSON.stringify(conResult));
-
-            if (conResult.status == 200) {
-                if (conResult.data.status == 'online' || conResult.data.status == 'ok') {
-                    this.log.debug(`all fine ${JSON.stringify(conResult.data)}`);
-                } else {
-                    if (conResult.data.data == 'login failed') {
-                        this.log.error('getInfosCloud login faild, adapter STOP');
-                        return void this.stop();
-                    }
-                    this.log.info(`reconnect ${Date.now()}`);
-                    _tokenData = await this.getTokenFirst();
-                    if (_tokenData != null) {
-                        conResult = await this.getAxiosData(
-                            `${baseUrl}?token=${_tokenData}&group=register&command=get%20device%20data`,
-                        );
-                    }
-                }
-
-                let result;
-
-                const devices = conResult.data.data;
-
-                if (!Array.isArray(devices) || devices.length === 0) {
-                    this.log.error('No devices found in cloud account');
-                    await this.setConnected(false);
-                    return;
-                }
-
-                const deviceIndex = this.config.deviceIndex || 0;
-
-                if (deviceIndex < 0 || deviceIndex >= devices.length) {
-                    this.log.warn(
-                        `Configured device index ${deviceIndex} is out of range (0-${devices.length - 1}). Using first device (index 0).`,
-                    );
-                }
-
-                const clampedIndex = Math.max(0, Math.min(deviceIndex, devices.length - 1));
-                const device = devices[clampedIndex];
-
-                _serialnumber = device.serialnumber;
-                await this.setState('SerialNumber', _serialnumber, true);
-                this.log.debug('-> SerialNumber');
-
-                await this.setState('SoftwareVersion', judoConv.getInValue(device.data[0].data, '1'), true);
-                this.log.debug('-> SoftwareVersion');
-                await this.setState('HardwareVersion', judoConv.getInValue(device.data[0].data, '2'), true);
-                this.log.debug('-> HardwareVersion');
-
-                _da = device.data[0].da;
-                this.log.debug(`-> _da ${_da}`);
-                _dt = device.data[0].dt;
-                this.log.debug(`-> _dt ${_dt}`);
-
-                // InstallationDate
-                result = judoConv.getInValue(device.data[0].data, '6');
-                this.log.debug(`-> InstallationDate ${result}`);
-                await this.setState('InstallationDate', Number(result), true);
-
-                // service
-                const rServiceDays = judoConv.getInValue(device.data[0].data, '6').split(':')[0];
-                await this.setState('ServiceDays', Number(rServiceDays), true);
-                this.log.debug(`-> ServiceDays ${rServiceDays}`);
-
-                await this.setState('Connection status', device.status === 'true' ? true : false, true);
-
-                //Maintenance
-                const rMaintenance = judoConv.getInValue(device.data[0].data, '7').split(':')[0];
-                await this.setState(`Maintenance`, Number(rMaintenance), true);
-                this.log.debug(`-> Maintenance ${rMaintenance}`);
-
-                //WaterTotal
-                result = judoConv.getInValue(device.data[0].data, '8');
-                await this.setState(`WaterTotal`, result, true);
-
-                result = judoConv.getInValue(device.data[0].data, '9');
-                await this.setState(`WaterTotalOut`, result, true);
-                this.log.debug('-> WaterTotal');
-
-                //SaltRange
-                result = judoConv.getInValue(device.data[0].data, '94');
-                let salzstand_rounded = 0;
-                let reichweite = 0;
-                let salzstand = 0;
-
-                if (result.indexOf(':') > -1) {
-                    reichweite = Math.round(result.split(':')[1]);
-                    salzstand = result.split(':')[0] / 1000;
-                    salzstand_rounded = parseInt(5 * Math.ceil(salzstand / 5));
-
-                    if (reichweite > 1) {
-                        await this.setState(`SaltRange`, Number(reichweite), true);
-                    } else {
-                        await this.setState(`SaltRange`, Number(salzstand_rounded), true);
-                    }
-                }
-
-                this.log.debug('-> SaltRange');
-
-                // NaturalHardness
-                //    result = parseInt(judoConv.getInValue(device.data[0].data, '790_26')/2)+2;
-                result = 0;
-                await this.setState(`NaturalHardness`, Number(result), true);
-                this.log.debug('-> NaturalHardness');
-
-                //ResidualHardness
-                result = judoConv.getInValue(device.data[0].data, '790_8');
-                await this.setState(`ResidualHardness`, Number(result), true);
-                this.log.debug('-> ResidualHardness');
-
-                //SaltQuantity
-                let sq = (salzstand_rounded * 100) / 50;
-                if (sq > 100) {
-                    sq = 100;
-                }
-
-                await this.setState(`SaltQuantity`, Number(sq), true);
-                this.log.debug('-> SaltQuantity');
-
-                //WaterCurrent
-                result = judoConv.getInValue(device.data[0].data, '790_1617');
-                await this.setState(`WaterCurrent`, Number(result), true);
-                this.log.debug('-> WaterCurrent');
-
-                //StandByValue
-                result = judoConv.getInValue(device.data[0].data, '792_9');
-                await this.setState(`StandByValue`, Number(result), true);
-                this.log.debug(`-> StandByValue${result}`);
-
-                //Battery
-                result = judoConv.getInValue(device.data[0].data, '93');
-                if (result && result.toString().indexOf(':') > -1) {
-                    const batt = result.split(':');
-                    await this.setState(`Battery`, Number(batt[0]), true);
-                    this.log.debug(`-> Battery${batt[0]}`);
-                }
-
-                // Cloud Register 137 mirrors local REST command 4300 on this i-dos eco.
-                const statusDataHexCloud = device.data[0].data[137]?.data;
-                if (typeof statusDataHexCloud === 'string') {
-                    const statusData = restData.decodeStatusData(statusDataHexCloud);
-                    if (statusData) {
-                        await this.setState('StatusData.RemainingAmountInTank', statusData.remainingAmountInTank, true);
-                        await this.setState(
-                            'StatusData.RemainingAmountInTankPercent',
-                            statusData.remainingAmountInTankPercent,
-                            true,
-                        );
-                        await this.setState('StatusData.Raw', statusDataHexCloud, true);
-                    }
-                }
-
-                await this.setState('lastInfoUpdate', Date.now(), true);
-                await this.setConnected(true);
-
-                this.ensurePollInterval(this.getInfosCloud);
+            await device.initialize();
+            if (!this.unloading) {
+                device.start();
             }
         } catch {
-            this.setState('info.connection', false, true);
-            this.log.error('getInfosCloud ERROR reconnect wait 5 min');
+            this.log.error(`[${id}] Could not initialize the device objects`);
+        }
+    }
 
-            if (_requestInterval) {
-                this.clearInterval(_requestInterval);
-                _requestInterval = null;
+    /**
+     * Serializes configuration changes from separate Device Manager dialogs.
+     *
+     * @param {() => Promise<void>} change - Device configuration change.
+     */
+    changeDevice(change) {
+        const task = this.deviceChanges.then(async () => {
+            await this.devicesLoaded;
+            if (this.unloading) {
+                throw new Error('The adapter is shutting down.');
             }
+            await change();
+        });
+        this.deviceChanges = task.catch(() => {});
+        return task;
+    }
 
+    /**
+     * @param {string} id - New device's stable identifier.
+     * @param {string} name - Display name.
+     * @param {DeviceConfig} config - Connection settings.
+     */
+    addDevice(id, name, config) {
+        return this.changeDevice(async () => {
+            if (!this.isDeviceId(id)) {
+                throw new Error(
+                    'Choose an unreserved object ID with up to 64 lowercase letters, digits, hyphens or underscores. Start with a letter or digit.',
+                );
+            }
+            const root = `${this.namespace}.${id}`;
+            const existing = await this.getObjectAsync(id);
+            const children = await this.getObjectListAsync({ startkey: `${root}.`, endkey: `${root}.\u9999` });
+            if (this.devices.has(id) || existing || children.rows.length) {
+                throw new Error('This object ID is already in use.');
+            }
+            await this.saveDevice(id, name, config);
+            await this.startDevice(id, name, config);
+        });
+    }
+
+    /**
+     * @param {JudoDevice} device - Device when the edit dialog was opened.
+     * @param {string} name - Updated display name.
+     * @param {DeviceConfig} config - Updated connection settings.
+     */
+    editDevice(device, name, config) {
+        return this.changeDevice(async () => {
+            this.checkCurrentDevice(device);
+            await this.saveDevice(device.id, name, config);
+            await device.stop();
+            await this.startDevice(device.id, name, config);
+            await this.updateConnection();
+        });
+    }
+
+    /** @param {JudoDevice} device - Device when the confirmation dialog was opened. */
+    removeDevice(device) {
+        return this.changeDevice(async () => {
+            this.checkCurrentDevice(device);
+            await device.stop();
             try {
-                if (_requestTimeout) {
-                    this.clearTimeout(_requestTimeout);
-                }
-                _requestTimeout = this.setTimeout(
-                    async () => {
-                        _requestTimeout = null;
-                        _tokenData = await this.getTokenFirst();
-                        if (_tokenData != null) {
-                            this.getInfosCloud();
-                        } else {
-                            this.log.error('getInfosCloud ERROR reconnect wait 5 min');
-                            return void this.restart();
-                        }
-                    },
-                    1000 * 60 * 5,
-                ); // warte 5 min
+                await this.delObjectAsync(device.id, { recursive: true });
             } catch {
-                return void this.restart();
+                await this.startDevice(device.id, device.name, device.config);
+                throw new Error('Could not remove the device objects.');
             }
-        }
-    }
-
-    async getInfosLocal() {
-        this.log.debug('get Consumption data Local');
-
-        let result;
-
-        try {
-            // check loged in
-            const stats = await this.getAxiosData(
-                `${baseUrl}register&command=plumber%20address&msgnumber=1&token=${_tokenData}`,
-            );
-
-            if (stats.data.status == 'error') {
-                this.log.info(`reconnect ${Date.now()}`);
-                _tokenData = await this.getTokenFirst();
-            }
-
-            if (_tokenData) {
-                //WaterCurrent
-                result = await this.getAxiosData(
-                    `${baseUrl}consumption&command=water%20current&msgnumber=1&token=${_tokenData}`,
-                );
-                const splWassCur = result.data.data.split(' ');
-                await this.setState(`WaterCurrent`, Number(splWassCur[0]), true);
-                await this.setState(`WaterCurrentOut`, Number(splWassCur[1]), true);
-                this.log.debug('-> WaterCurrent');
-
-                //ResidualHardness
-                result = await this.getAxiosData(
-                    `${baseUrl}settings&command=residual%20hardness&msgnumber=1&token=${_tokenData}`,
-                );
-                await this.setState(`ResidualHardness`, Number(result.data.data), true);
-                this.log.debug('-> ResidualHardness');
-
-                //SaltRange
-                result = await this.getAxiosData(
-                    `${baseUrl}consumption&command=salt%20range&msgnumber=1&token=${_tokenData}`,
-                );
-                await this.setState(`SaltRange`, Number(result.data.data), true);
-
-                this.log.debug('-> SaltRange');
-
-                //SaltQuantity
-                result = await this.getAxiosData(
-                    `${baseUrl}consumption&command=salt%20quantity&msgnumber=1&token=${_tokenData}`,
-                );
-                let sq = result.data.data;
-                sq = Math.round((sq / 50000) * 100);
-
-                await this.setState(`SaltQuantity`, Number(sq), true);
-                this.log.debug('-> SaltQuantity');
-
-                //WaterAverage
-                result = await this.getAxiosData(
-                    `${baseUrl}consumption&command=water%20average&msgnumber=1&token=${_tokenData}`,
-                );
-                await this.setState(`WaterAverage`, Number(result.data.data), true);
-                this.log.debug('-> WaterAverage');
-
-                //NaturalHardness
-                result = await this.getAxiosData(
-                    `${baseUrl}info&command=natural%20hardness&msgnumber=1&token=${_tokenData}`,
-                );
-                await this.setState(`NaturalHardness`, Number(result.data.data), true);
-                this.log.debug('-> NaturalHardness');
-
-                //FlowRate
-                result = await this.getAxiosData(
-                    `${baseUrl}waterstop&command=flow%20rate&msgnumber=1&token=${_tokenData}`,
-                );
-                await this.setState(`FlowRate`, Number(result.data.data), true);
-                this.log.debug('-> FlowRate');
-
-                //Quantity
-                result = await this.getAxiosData(
-                    `${baseUrl}waterstop&command=quantity&msgnumber=1&token=${_tokenData}`,
-                );
-                await this.setState(`Quantity`, Number(result.data.data), true);
-                this.log.debug('-> Quantity');
-
-                //WaterTotal
-                result = await this.getAxiosData(
-                    `${baseUrl}consumption&command=water%20total&msgnumber=1&token=${_tokenData}`,
-                );
-
-                const splWassTot = result.data.data.split(' ');
-                await this.setState(`WaterTotal`, splWassTot[1] / 1000, true);
-                await this.setState(`WaterTotalOut`, splWassTot[2] / 1000, true);
-                this.log.debug(`-> WaterTotaal ${result.data.data}`);
-
-                //WaterYearly
-                result = await this.getAxiosData(
-                    `${baseUrl}consumption&command=water%20yearly&msgnumber=1&token=${_tokenData}`,
-                );
-                const splWassJahr = result.data.data.split(' ');
-                for (let b = 1; b < 13; b++) {
-                    let a = b;
-                    if (a < 10) {
-                        a = `0${a}`;
-                    }
-
-                    let monat = splWassJahr[b];
-
-                    this.log.debug(`WaterYearly.${a} ${monat} ${splWassJahr[b]}`);
-
-                    if (monat > 0) {
-                        monat = monat / 1000;
-                    } else {
-                        monat = 0;
-                    }
-
-                    await this.setState(`WaterYearly.${a}`, monat, true);
-                }
-                this.log.debug('-> WaterYearly');
-
-                if (!_pauseStandBy) {
-                    //StandBy
-                    result = await this.getAxiosData(
-                        `${baseUrl}waterstop&command=standby&msgnumber=1&token=${_tokenData}`,
-                    );
-                    await this.setState(`StandByValue`, Number(result.data.data), true);
-                    this.log.debug('-> StandBy');
-                    _pauseStandBy = false;
-                }
-
-                if (!_pauseValveState) {
-                    //ValveState
-                    result = await this.getAxiosData(
-                        `${baseUrl}waterstop&command=valve&msgnumber=1&token=${_tokenData}`,
-                    );
-                    await this.setState(`WaterStopStatus`, result.data.data, true);
-
-                    if (result.data.data == 'opened') {
-                        await this.setState(`WaterStop`, false, true);
-                    } else {
-                        await this.setState(`WaterStop`, true, true);
-                    }
-
-                    this.log.debug('-> ValveState');
-                }
-                await this.setState('lastInfoUpdate', Date.now(), true);
-                await this.setConnected(true);
-            } // if _tokenData
-        } catch {
-            this.setState('info.connection', false, true);
-            this.log.error('getInfos ERROR ');
-        } finally {
-            this.ensurePollInterval(this.getInfosLocal);
-        }
-    }
-
-    async callRestApi(commandHex, dataHex = '') {
-        const command = restData.normalizeHexString(commandHex);
-        const data = restData.normalizeHexString(dataHex);
-        const response = await this.getAxiosData(`${baseUrl}${command}${data}`);
-        return response;
-    }
-
-    async getRestData(commandHex) {
-        const response = await this.callRestApi(commandHex);
-        if (!response || response.status !== 200) {
-            return null;
-        }
-        return restData.getRestPayloadData(response.data);
-    }
-
-    async getInfoStaticLocalRest() {
-        this.log.debug('get Information Static Local REST');
-
-        try {
-            const deviceTypeHex = await this.getRestData('FF00');
-            const deviceType = restData.decodeWtuType(deviceTypeHex);
-            wtuType = deviceType.num;
-            this.log.debug(`-> deviceType ${JSON.stringify(deviceType)} (${deviceTypeHex})`);
-            await this.setState('wtuType', deviceType.text, true);
-
-            const serialNumberHex = await this.getRestData('0600');
-            const serialNumber = restData.decodeSerialNumber(serialNumberHex);
-            this.log.debug(`-> serialNumber ${serialNumber} (${serialNumberHex})`);
-            await this.setState('SerialNumber', serialNumber, true);
-
-            const softwareVersionHex = await this.getRestData('0100');
-            const softwareVersion = restData.decodeSoftwareVersion(softwareVersionHex);
-            this.log.debug(`-> softwareVersion ${softwareVersion} (${softwareVersionHex})`);
-            await this.setState('SoftwareVersion', softwareVersion, true);
-
-            const instDateHex = await this.getRestData('0E00');
-            const instDate = restData.decodeCommissioningDate(instDateHex);
-            this.log.debug(`-> InstallationDate: ${instDate} (${instDateHex})`);
-            await this.setState('InstallationDate', instDate, true);
-        } catch (err) {
-            this.log.error(`REST ERROR in getInfoStaticLocalRest: ${JSON.stringify(err)}`);
-        }
-
-        if (wtuType === 0x41) {
-            await this.createIdosEcoStates();
-        }
-    }
-
-    async createIdosEcoStates() {
-        /*
-            Statusdaten abfragen
-         */
-
-        await this.extendObject(`StatusData`, {
-            type: 'channel',
-            common: {
-                name: `WaterYearly`,
-            },
-            native: {},
-        });
-
-        // provide the full response of /api/rest/4300 as expert object. no real docs what all those values actually mean ...
-        await this.extendObject(`StatusData.Raw`, {
-            type: 'state',
-            common: {
-                name: `Raw value of status StatusData query`,
-                type: 'string',
-                read: true,
-                write: false,
-                expert: true,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.CircuitType`, {
-            type: 'state',
-            common: {
-                name: `Schaltungstyp`,
-                type: 'string',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.OperatingMode`, {
-            type: 'state',
-            common: {
-                name: `Betriebsmodus`,
-                type: 'string',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.Concentration`, {
-            type: 'state',
-            common: {
-                name: `Konzentration (min, Norm, max)`,
-                type: 'string',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.ErrorCode`, {
-            type: 'state',
-            common: {
-                name: `Fehlercode`,
-                type: 'string',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.Warnings`, {
-            type: 'state',
-            common: {
-                name: `Warnmeldungen`,
-                type: 'string',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.DosingAmount`, {
-            type: 'state',
-            common: {
-                name: `Dosiermenge`,
-                type: 'string',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.DosingAmount`, {
-            type: 'state',
-            common: {
-                name: `Dosiermenge`,
-                type: 'string',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.CurrentWaterFlow`, {
-            type: 'state',
-            common: {
-                name: `Wasserdurchfluss`,
-                type: 'string',
-                read: true,
-                write: false,
-                unit: 'l/h',
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.RemainingAmountInTank`, {
-            type: 'state',
-            common: {
-                name: `Restmenge im Behälter`,
-                type: 'number',
-                read: true,
-                write: false,
-                unit: 'l',
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.RemainingAmountInTankPercent`, {
-            type: 'state',
-            common: {
-                name: `Restmenge im Behälter (%)`,
-                type: 'number',
-                read: true,
-                write: false,
-                unit: '%',
-            },
-            native: {},
-        });
-
-        await this.extendObject(`StatusData.WaterConsumption`, {
-            type: 'state',
-            common: {
-                name: `Wasserverbrauch`,
-                type: 'string',
-                read: true,
-                write: false,
-                unit: 'l',
-            },
-            native: {},
-        });
-
-        /*
-            Dosierung lesen
-         */
-
-        await this.extendObject(`Dosage`, {
-            type: 'channel',
-            common: {
-                name: `Dosierung`,
-            },
-            native: {},
-        });
-
-        // provide the full response of /api/rest/6300 as expert object. no real docs what all those values actually mean ...
-        await this.extendObject(`Dosage.Raw`, {
-            type: 'state',
-            common: {
-                name: `Raw value of status DosData query`,
-                type: 'string',
-                read: true,
-                write: false,
-                expert: true,
-            },
-            native: {},
+            this.devices.delete(device.id);
+            await this.updateConnection();
         });
     }
 
-    async getInfosLocalRest() {
-        this.log.debug('get Consumption data Local REST');
-        let connected = false;
-
-        const read = async commandHex => {
-            const data = await this.getRestData(commandHex);
-            if (data) {
-                connected = true;
-            }
-            return data;
-        };
-
-        try {
-            /*
-                tested with own devices
-             */
-
-            const runtimeHex = await read('2500');
-            const runtimeHours = restData.decodeRuntimeCounter(runtimeHex);
-            this.log.debug(`-> OperatingHours ${runtimeHours} (${runtimeHex})`);
-            await this.setState('OperatingHours', runtimeHours, true);
-
-            const softWaterHex = await read('2900');
-            const softWater = restData.decodeSoftWaterAmount(softWaterHex);
-            this.log.debug(`-> SoftWater ${softWater} (${softWaterHex})`);
-            await this.setState('WaterTotalOut', softWater, true);
-
-            const yearHex = restData.formatYearToHex(new Date().getFullYear());
-            const yearlyWaterHex = await read(`FE00${yearHex}`);
-            const yearlyWater = restData.decodeYearlyStatistics(yearlyWaterHex);
-            this.log.debug(`-> WaterYearly ${JSON.stringify(yearlyWater)} (${yearlyWaterHex})`);
-            if (yearlyWater) {
-                for (const [month, monthValue] of Object.entries(yearlyWater)) {
-                    const id = month.toString().padStart(2, '0');
-                    await this.setState(`WaterYearly.${id}`, monthValue, true);
-                }
-            }
-
-            const totalWaterHex = await read('2800');
-            const totalWater = restData.decodeTotalWaterAmount(totalWaterHex);
-            this.log.debug(`-> WaterTotal ${totalWater} (${totalWaterHex})`);
-            await this.setState('WaterTotal', totalWater, true);
-
-            const dateTimeHex = await read('6100');
-            const dateTime = restData.decodeDateTime(dateTimeHex);
-            this.log.debug(`-> Date ${dateTime} (${dateTimeHex})`);
-            await this.setState('Date', dateTime, true);
-
-            if (wtuType === 0x41) {
-                const statusDataHex = await read('4300'); // data that must be fetched only on i-dos eco device as connectivity module would return 400 error on other devices
-                const statusData = restData.decodeStatusData(statusDataHex);
-                this.log.debug(`-> StatusData ${JSON.stringify(statusData)} (${statusDataHex})`);
-                if (statusDataHex) {
-                    await this.setState('StatusData.Raw', statusDataHex, true);
-                }
-                // TODO: figure out what all those values actually mean -> possibly provide better type / role (and add corresponding test)
-                // one response got from device: 0200010300000000010000000000000000f3001c0000000000825f0000
-                if (statusData) {
-                    await this.setState('StatusData.CircuitType', statusData.circuitType, true);
-                    await this.setState('StatusData.OperatingMode', statusData.operatingMode, true);
-                    await this.setState('StatusData.Concentration', statusData.concentration, true);
-                    await this.setState('StatusData.ErrorCode', statusData.errorCode, true);
-                    await this.setState('StatusData.Warnings', statusData.warnings, true);
-                    await this.setState('StatusData.DosingAmount', statusData.dosingAmount, true);
-                    await this.setState('StatusData.CurrentWaterFlow', statusData.currentWaterFlow, true);
-                    await this.setState('StatusData.RemainingAmountInTank', statusData.remainingAmountInTank, true);
-                    await this.setState(
-                        'StatusData.RemainingAmountInTankPercent',
-                        statusData.remainingAmountInTankPercent,
-                        true,
-                    );
-                    await this.setState('StatusData.WaterConsumption', statusData.waterConsumption, true);
-                }
-
-                const dosageHex = await read('6300');
-                const dosage = restData.decodeDosage(dosageHex);
-                // TODO: figure out what all those values actually mean (and add corresponding test)
-                // one response got from device: 0102
-                this.log.debug(`-> Dosage ${JSON.stringify(dosage)} (${dosageHex})`);
-                if (dosageHex) {
-                    await this.setState('Dosage.Raw', dosageHex, true);
-                }
-            }
-
-            /*
-                based on docs:
-             */
-
-            const residualHardnessHex = await read('5100');
-            if (residualHardnessHex) {
-                const residualHardness = restData.hexLeToNumber(residualHardnessHex);
-                if (residualHardness !== null) {
-                    await this.setState('ResidualHardness', residualHardness, true);
-                }
-            }
-
-            const saltHex = await read('5600');
-            if (saltHex && saltHex.length >= 8) {
-                const saltGramm = restData.hexLeToNumber(saltHex.slice(0, 4));
-                const saltRangeDays = restData.hexLeToNumber(saltHex.slice(4, 8));
-                if (saltRangeDays !== null) {
-                    await this.setState('SaltRange', saltRangeDays, true);
-                }
-                if (saltGramm !== null) {
-                    const saltPercent = Math.min(100, Math.round((saltGramm / 50000) * 100));
-                    await this.setState('SaltQuantity', saltPercent, true);
-                }
-            }
-
-            if (connected) {
-                await this.setState('lastInfoUpdate', Date.now(), true);
-            }
-            await this.setConnected(connected);
-        } catch (err) {
-            await this.setConnected(false);
-            this.log.error(`REST ERROR in getInfosLocalRest: ${JSON.stringify(err)}`);
-        } finally {
-            this.ensurePollInterval(this.getInfosLocalRest);
+    /** @param {JudoDevice} device - Device that the action applies to. */
+    checkCurrentDevice(device) {
+        if (!this.isDeviceId(device.id) || this.devices.get(device.id) !== device) {
+            throw new Error('The device configuration has changed. Reopen the device to try again.');
         }
     }
 
-    async setCommandStateLocalRest(command, state) {
-        try {
-            switch (command) {
-                case 'Regeneration':
-                    this.log.debug(`set Regeneration Local REST ${state}`);
-                    if (state) {
-                        await this.callRestApi('350000');
-                    }
-                    break;
-                case 'WaterStop':
-                    this.log.debug(`set WaterStop Local REST ${state}`);
-                    _pauseValveState = true;
-                    if (state) {
-                        await this.callRestApi('3C00');
-                        await this.setState('WaterStopStatus', 'closed', true);
-                    } else {
-                        await this.callRestApi('3D00');
-                        await this.setState('WaterStopStatus', 'opened', true);
-                    }
-                    _pauseValveState = false;
-                    break;
-                case 'ResidualHardness':
-                    this.log.debug(`set ResidualHardness Local REST ${state}`);
-                    await this.callRestApi(`3000${restData.toHexByte(state)}`);
-                    break;
-                default:
-                    break;
-            }
-        } catch {
-            _pauseValveState = false;
-            _pauseStandBy = false;
-            this.log.error(`setCommandStateLocalRest ${command} ERROR`);
-        }
-    }
-
-    async setCommandStateCloud(command, state) {
-        switch (command) {
-            case 'Regeneration':
-                this.log.debug(`set Regeneration Cloud ${state}`);
-                await this.getAxiosData(
-                    `${baseUrl}?token=${_tokenData}&group=register&command=write%20data&serial_number=${
-                        _serialnumber
-                    }&dt=${_dt}&index=65&data=&da=${_da}&role=customer`,
-                );
-                break;
-            case 'WaterStop':
-                this.log.debug(`set WaterStop Cloud${state}`);
-                _pauseValveState = true; // fÃ¼r getInfo
-
-                if (state) {
-                    const val = await this.getAxiosData(
-                        `${baseUrl}?token=${_tokenData}&group=register&command=write%20data&serial_number=${
-                            _serialnumber
-                        }&dt=${_dt}&index=72&data=&da=${_da}&role=customer`,
-                    );
-                    await this.setState('WaterStopStatus', val.data.status, true);
-                } else {
-                    const val = await this.getAxiosData(
-                        `${baseUrl}?token=${_tokenData}&group=register&command=write%20data&serial_number=${
-                            _serialnumber
-                        }&dt=${_dt}&index=73&data=&da=${_da}&role=customer`,
-                    );
-                    await this.setState('WaterStopStatus', val.data.status, true);
-                }
-                _pauseValveState = false;
-
-                break;
-            case 'StandBy':
-                this.log.debug(`set StandBy Cloud${state}`);
-                _pauseStandBy = true; // fÃ¼r getInfo
-                if (state) {
-                    await this.getAxiosData(
-                        `${baseUrl}?token=${_tokenData}&group=register&command=write%20data&serial_number=${
-                            _serialnumber
-                        }&dt=${_dt}&index=171&data=&da=${_da}&role=customer`,
-                    );
-                } else {
-                    await this.getAxiosData(
-                        `${baseUrl}?token=${_tokenData}&group=register&command=write%20data&serial_number=${
-                            _serialnumber
-                        }&dt=${_dt}&index=73&data=&da=${_da}&role=customer`,
-                    );
-                }
-                _pauseStandBy = false;
-
-                break;
-            case 'ResidualHardness':
-                this.log.debug(`set ResidualHardness Cloud ${state}`);
-                await this.getAxiosData(
-                    `${baseUrl}?token=${_tokenData}&group=register&command=write%20data&serial_number=${
-                        _serialnumber
-                    }&dt=${_dt}&index=60&data=${state}&da=${_da}&role=customer`,
-                );
-                break;
-            default:
-        }
-    }
-
-    async setCommandStateLocal(command, state) {
-        switch (command) {
-            case 'Regeneration':
-                this.log.debug(`set Regeneration Local ${state}`);
-                try {
-                    await this.getAxiosData(
-                        `${baseUrl}settings&command=regeneration&msgnumber=1&token=${_tokenData}&parameter=start`,
-                    );
-                } catch (err) {
-                    this.log.error(`set ResidualHardness Local ERROR${JSON.stringify(err)}`);
-                }
-                break;
-            case 'WaterStop':
-                this.log.debug(`set WaterStop Local${state}`);
-                _pauseValveState = true; // fÃ¼r getInfo
-                if (state) {
-                    try {
-                        const val = await this.getAxiosData(
-                            `${baseUrl}waterstop&command=valve&msgnumber=1&token=${_tokenData}&parameter=close`,
-                        );
-                        await this.setState('WaterStopStatus', val.data.parameter, true);
-                    } catch {
-                        this.setState('WaterStopStatus', 'close', true);
-                        this.log.error('set WaterStopStatus close ERROR');
-                    }
-                } else {
-                    try {
-                        const val = await this.getAxiosData(
-                            `${baseUrl}waterstop&command=valve&msgnumber=1&token=${_tokenData}&parameter=open`,
-                        );
-                        await this.setState('WaterStopStatus', val.data.parameter, true);
-                    } catch {
-                        this.setState('WaterStopStatus', 'open', true);
-                        this.log.error('set WaterStopStatus open ERROR');
-                    }
-                }
-                _pauseValveState = false;
-
-                break;
-            case 'StandBy':
-                this.log.debug(`set StandBy Local${state}`);
-                _pauseStandBy = true; // fÃ¼r getInfo
-                if (state) {
-                    try {
-                        await await this.getAxiosData(
-                            `${baseUrl}waterstop&command=standby&msgnumber=1&token=${_tokenData}&parameter=start`,
-                        );
-                    } catch {
-                        this.log.error('set StandBy Local start ERROR');
-                    }
-                } else {
-                    try {
-                        await await this.getAxiosData(
-                            `${baseUrl}waterstop&command=standby&msgnumber=1&token=${_tokenData}&parameter=stop`,
-                        );
-                    } catch {
-                        this.log.error('set StandBy Local stop ERROR');
-                    }
-                }
-                //StandByValue
-                {
-                    const valSt = await this.getAxiosData(
-                        `${baseUrl}waterstop&command=standby&msgnumber=1&token=${_tokenData}`,
-                    );
-                    await this.setState(`StandByValue`, Number(valSt.data.data), true);
-                }
-                _pauseStandBy = false;
-
-                break;
-            case 'ResidualHardness':
-                this.log.debug(`set ResidualHardness Local${state}`);
-                try {
-                    await this.getAxiosData(
-                        `${baseUrl}settings&command=residual%20hardness&msgnumber=1&token=${_tokenData}&parameter=${
-                            state
-                        }`,
-                    );
-                } catch {
-                    this.log.error('set ResidualHardness Local ERROR');
-                }
-                break;
-            default:
-        }
-    }
-
-    async getTokenFirst() {
-        if (this.isRestApiMode()) {
-            return 'REST_API_MODE';
-        }
-
-        let statusURL = '';
-
-        if (this.isCloudMode()) {
-            statusURL = `${baseUrl}?group=register&command=login&msgnumber=1&name=login&user=${
-                this.config.user
-            }&password=${md5(this.config.password)}&nohash=Service&role=customer`;
-            this.log.debug('get statusURL for Cloud');
-        } else {
-            statusURL = `${baseUrl}register&command=login&msgnumber=1&name=login&user=${this.config.user}&password=${
-                this.config.password
-            }&role=customer`;
-            this.log.debug('get statusURL for local');
-        }
-
-        let token;
-
-        try {
-            const tokenObject = await this.getAxiosData(statusURL);
-
-            if (tokenObject.status == 200) {
-                // der wird evtl. nicht gebraucht
-                if (tokenObject.data.status == 'online' || tokenObject.data.status == 'ok') {
-                    token = tokenObject.data.token;
-
-                    await this.setState('token', token, true);
-
-                    //Serial only local
-                    if (!this.isCloudMode()) {
-                        const serResult = await this.getAxiosData(
-                            `${baseUrl}register&command=show&msgnumber=2&token=${token}`,
-                        );
-
-                        this.log.debug(`getSerialnumber : ${JSON.stringify(serResult.data)}`);
-
-                        const wtuType = serResult.data.data[0]['wtuType'];
-                        const serialN = serResult.data.data[0]['serial number'];
-
-                        await this.setState('wtuType', wtuType, true);
-                        this.log.debug(`getwtuType ${wtuType}`);
-
-                        await this.setState('SerialNumber', serialN, true);
-                        this.log.debug(`getserialN ${serialN}`);
-
-                        //Connect
-                        const conResult = await this.getAxiosData(
-                            `${baseUrl}register&command=connect&msgnumber=1&token=${token}&parameter=${
-                                wtuType
-                            }&serial%20number=${serialN}`,
-                        );
-                        this.log.debug(`connect Result: ${JSON.stringify(conResult.data)}`);
-
-                        await this.setState('Connection status', conResult.data.status === 'true' ? true : false, true);
-                    }
-                } else {
-                    token = null;
-                    if (tokenObject.data.data == 'login failed') {
-                        this.log.error('getInfosCloud login faild, adapter STOP');
-                        return void this.stop();
-                    }
-                }
-                return token;
-            }
-            this.setState('info.connection', false, true);
-            this.setState('Connection status', 'ERROR', true);
-            this.log.error('Check Login data (user:psw)');
-            return null;
-        } catch {
-            this.setState('Connection status', 'ERROR', true);
-            this.setState('info.connection', false, true);
-            return null;
-        }
-    }
-
-    async getAxiosData(url) {
-        options.url = url;
-
-        try {
-            const response = await axios(options);
-            return response;
-        } catch {
-            return false;
-        }
-    }
-
-    async create_state() {
-        this.log.debug(`create state`);
-
-        if (!this.isRestApiMode()) {
-            await this.extendObjectAsync(`token`, {
-                type: 'state',
-                common: {
-                    name: `token`,
-                    type: 'string',
-                    read: true,
-                    write: false,
-                    role: 'info',
-                },
-                native: {},
-            });
-        }
-
-        await this.extendObjectAsync(`lastInfoUpdate`, {
-            type: 'state',
-            common: {
-                name: 'Date/Time of last information update',
-                type: 'number',
-                role: 'value.time',
-                read: true,
-                write: false,
-            },
-            native: {},
+    /**
+     * @param {string} id - Device identifier.
+     * @param {string} name - Display name.
+     * @param {DeviceConfig} config - Connection settings.
+     */
+    async saveDevice(id, name, config) {
+        const { password, ...settings } = config;
+        await this.extendObjectAsync(id, {
+            type: 'device',
+            common: { name },
+            native: { judoisoft: { ...settings, password: password ? this.encrypt(password) : '' } },
         });
-
-        if (!this.isRestApiMode()) {
-            if (this.isCloudMode()) {
-                await this.extendObjectAsync(`ServiceDays`, {
-                    type: 'state',
-                    common: {
-                        name: `ServiceDays`,
-                        type: 'number',
-                        role: 'info',
-                        read: true,
-                        write: false,
-                    },
-                    native: {},
-                });
-            } else {
-                await this.extendObjectAsync(`ServiceDate`, {
-                    type: 'state',
-                    common: {
-                        name: `ServiceDate`,
-                        type: 'number',
-                        role: 'value.time',
-                        read: true,
-                        write: false,
-                    },
-                    native: {},
-                });
-            }
-        }
-
-        await this.extendObjectAsync(`InstallationDate`, {
-            type: 'state',
-            common: {
-                name: `InstallationDate`,
-                type: 'number',
-                role: 'value.time',
-                read: true,
-                write: false,
-            },
-            native: {},
-        });
-
-        if (this.isRestApiMode()) {
-            await this.extendObjectAsync(`OperatingHours`, {
-                type: 'state',
-                common: {
-                    name: `OperatingHours`,
-                    type: 'number',
-                    role: 'info',
-                    unit: 'h',
-                    read: true,
-                    write: false,
-                },
-                native: {},
-            });
-        }
-
-        if (this.isCloudMode()) {
-            await this.extendObjectAsync(`Battery`, {
-                type: 'state',
-                common: {
-                    name: `Battery`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: '%',
-                },
-                native: {},
-            });
-
-            // Cloud register 137 contains i-dos eco status payload.
-            await this.extendObjectAsync(`StatusData`, {
-                type: 'channel',
-                common: {
-                    name: `StatusData`,
-                },
-                native: {},
-            });
-
-            await this.extendObjectAsync(`StatusData.Raw`, {
-                type: 'state',
-                common: {
-                    name: `Raw value of cloud status data`,
-                    type: 'string',
-                    read: true,
-                    write: false,
-                    expert: true,
-                },
-                native: {},
-            });
-
-            await this.extendObjectAsync(`StatusData.RemainingAmountInTank`, {
-                type: 'state',
-                common: {
-                    name: `Restmenge im Behälter`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    unit: 'l',
-                },
-                native: {},
-            });
-
-            await this.extendObjectAsync(`StatusData.RemainingAmountInTankPercent`, {
-                type: 'state',
-                common: {
-                    name: `Restmenge im Behälter (%)`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    unit: '%',
-                },
-                native: {},
-            });
-        }
-
-        if (this.isCloudMode()) {
-            await this.extendObjectAsync(`WaterCurrent`, {
-                type: 'state',
-                common: {
-                    name: `WaterCurrent`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'l/h',
-                },
-                native: {},
-            });
-            await this.extendObjectAsync(`WaterCurrentOut`, {
-                type: 'state',
-                common: {
-                    name: `WaterCurrentOut`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'l/h',
-                },
-                native: {},
-            });
-        } else {
-            await this.extendObjectAsync(`WaterCurrent`, {
-                type: 'state',
-                common: {
-                    name: `WaterCurrent`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'l',
-                },
-                native: {},
-            });
-            await this.extendObjectAsync(`WaterCurrentOut`, {
-                type: 'state',
-                common: {
-                    name: `WaterCurrentOut`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'l',
-                },
-                native: {},
-            });
-        }
-
-        // not in the cloud
-        if (!this.isCloudMode()) {
-            await this.extendObjectAsync(`WaterYearly`, {
-                type: 'channel',
-                common: {
-                    name: `WaterYearly`,
-                },
-                native: {},
-            });
-
-            for (let b = 1; b < 13; b++) {
-                if (b < 10) {
-                    b = `0${b}`;
-                }
-                await this.extendObjectAsync(`WaterYearly.${b}`, {
-                    type: 'state',
-                    common: {
-                        name: `${b}`,
-                        type: 'number',
-                        read: true,
-                        write: false,
-                        def: 0,
-                        role: 'info',
-                        unit: 'm3',
-                    },
-                    native: {},
-                });
-            }
-        }
-
-        await this.extendObjectAsync(`SaltRange`, {
-            type: 'state',
-            common: {
-                name: `SaltRange`,
-                type: 'number',
-                read: true,
-                write: false,
-                def: 0,
-                role: 'info',
-                unit: 'Tage',
-            },
-            native: {},
-        });
-
-        if (!this.isRestApiMode()) {
-            await this.extendObjectAsync(`Maintenance`, {
-                type: 'state',
-                common: {
-                    name: `Maintenance`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'Tage',
-                },
-                native: {},
-            });
-        }
-
-        await this.extendObjectAsync(`SaltQuantity`, {
-            type: 'state',
-            common: {
-                name: `SaltQuantity`,
-                type: 'number',
-                read: true,
-                write: false,
-                def: 0,
-                role: 'info',
-                unit: '%',
-            },
-            native: {},
-        });
-
-        await this.extendObjectAsync(`ResidualHardness`, {
-            type: 'state',
-            common: {
-                name: `ResidualHardness`,
-                type: 'number',
-                read: true,
-                write: true,
-                def: 0,
-                role: 'info',
-                unit: '°dH',
-                min: 0,
-                max: 12,
-            },
-            native: {},
-        });
-
-        await this.extendObjectAsync(`NaturalHardness`, {
-            type: 'state',
-            common: {
-                name: `NaturalHardness`,
-                type: 'number',
-                read: true,
-                write: false,
-                def: 0,
-                role: 'info',
-                unit: '°dH',
-            },
-            native: {},
-        });
-
-        await this.extendObjectAsync(`FlowRate`, {
-            type: 'state',
-            common: {
-                name: `max flow rate per h`,
-                type: 'number',
-                read: true,
-                write: false,
-                def: 0,
-                role: 'info',
-                unit: 'l/h',
-            },
-            native: {},
-        });
-        await this.extendObjectAsync(`SoftwareVersion`, {
-            type: 'state',
-            common: {
-                name: `SoftwareVersion`,
-                type: 'string',
-                read: true,
-                write: false,
-                role: 'info',
-            },
-            native: {},
-        });
-        if (!this.isRestApiMode()) {
-            await this.extendObjectAsync(`HardwareVersion`, {
-                type: 'state',
-                common: {
-                    name: `HardwareVersion`,
-                    type: 'string',
-                    read: true,
-                    write: false,
-                    role: 'info',
-                },
-                native: {},
-            });
-        }
-        if (this.isCloudMode()) {
-            await this.extendObjectAsync(`WaterTotal`, {
-                type: 'state',
-                common: {
-                    name: `WaterTotal`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'l',
-                },
-                native: {},
-            });
-            await this.extendObjectAsync(`WaterTotalOut`, {
-                type: 'state',
-                common: {
-                    name: `WaterTotalOut`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'l',
-                },
-                native: {},
-            });
-        } else {
-            await this.extendObjectAsync(`WaterTotal`, {
-                type: 'state',
-                common: {
-                    name: `WaterTotal`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'm3',
-                },
-                native: {},
-            });
-
-            await this.extendObjectAsync(`WaterTotalOut`, {
-                type: 'state',
-                common: {
-                    name: `WaterTotalOut`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'm3',
-                },
-                native: {},
-            });
-
-            await this.extendObjectAsync(`wtuType`, {
-                type: 'state',
-                common: {
-                    name: `wtuType`,
-                    type: 'string',
-                    read: true,
-                    write: false,
-                    role: 'info',
-                },
-                native: {},
-            });
-        }
-
-        await this.extendObjectAsync(`WaterAverage`, {
-            type: 'state',
-            common: {
-                name: `WaterAverage`,
-                type: 'number',
-                read: true,
-                write: false,
-                def: 0,
-                role: 'info',
-                unit: 'l',
-            },
-            native: {},
-        });
-
-        await this.extendObjectAsync(`Quantity`, {
-            type: 'state',
-            common: {
-                name: `withdrawal quantity`,
-                type: 'number',
-                read: true,
-                write: false,
-                def: 0,
-                role: 'info',
-                unit: 'l',
-            },
-            native: {},
-        });
-
-        await this.extendObjectAsync(`SerialNumber`, {
-            type: 'state',
-            common: {
-                name: `SerialNumber`,
-                type: 'string',
-                read: true,
-                write: false,
-                role: 'info',
-            },
-            native: {},
-        });
-
-        if (!this.isRestApiMode()) {
-            await this.extendObjectAsync(`Connection status`, {
-                type: 'state',
-                common: {
-                    name: `Connection status`,
-                    type: 'boolean',
-                    read: true,
-                    write: false,
-                    def: false,
-                    role: 'info',
-                },
-                native: {},
-            });
-
-            await this.extendObjectAsync(`StandByValue`, {
-                type: 'state',
-                common: {
-                    name: `StandByValue`,
-                    type: 'number',
-                    read: true,
-                    write: false,
-                    def: 0,
-                    role: 'info',
-                    unit: 'h',
-                },
-                native: {},
-            });
-
-            await this.extendObjectAsync(`StandBy`, {
-                type: 'state',
-                common: {
-                    name: `StandBy`,
-                    type: 'boolean',
-                    role: 'info',
-                    def: false,
-                    read: true,
-                    write: true,
-                },
-                native: {},
-            });
-        }
-
-        await this.extendObjectAsync(`Regeneration`, {
-            type: 'state',
-            common: {
-                name: `Regeneration`,
-                type: 'boolean',
-                role: 'button',
-                def: false,
-                read: true,
-                write: true,
-            },
-            native: {},
-        });
-
-        await this.extendObjectAsync(`WaterStopStatus`, {
-            type: 'state',
-            common: {
-                name: `WaterStopStatus`,
-                type: 'string',
-                read: true,
-                write: false,
-                role: 'info',
-            },
-            native: {},
-        });
-
-        await this.extendObjectAsync(`WaterStop`, {
-            type: 'state',
-            common: {
-                name: `WaterStop`,
-                type: 'boolean',
-                role: 'state',
-                def: false,
-                read: true,
-                write: true,
-            },
-            native: {},
-        });
-
-        if (this.isRestApiMode()) {
-            await this.extendObject(`Date`, {
-                type: 'state',
-                common: {
-                    name: `Date/Time on device`,
-                    type: 'number',
-                    role: 'value.time',
-                    read: true,
-                    write: false,
-                },
-                native: {},
-            });
-        }
-
-        await this.subscribeStates(`WaterStop`);
-        await this.subscribeStates(`Regeneration`);
-        await this.subscribeStates(`ResidualHardness`);
-        if (!this.isRestApiMode()) {
-            await this.subscribeStates(`StandBy`);
-        }
-    }
-
-    async timeConverter(tstmp) {
-        const a = new Date(tstmp * 1000);
-        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        const year = a.getFullYear();
-        const month = months[a.getMonth()];
-        const date = a.getDate();
-        let hour = a.getHours();
-        if (hour < 10) {
-            hour = `0${hour}`;
-        }
-        let min = a.getMinutes();
-        if (min < 10) {
-            min = `0${min}`;
-        }
-
-        const time = `${date} ${month} ${year} ${hour}:${min}`;
-        return time;
-    }
-
-    async initialization() {
-        try {
-            if (this.isRestApiMode()) {
-                if (this.config.ip === undefined) {
-                    this.log.error(`IP undefined`);
-                    return;
-                }
-                const encodedUser = encodeURIComponent(this.config.user || '');
-                const encodedPassword = encodeURIComponent(this.config.password || '');
-                baseUrl = `http://${encodedUser}:${encodedPassword}@${this.config.ip}/api/rest/`;
-            } else if (this.isCloudMode()) {
-                baseUrl = 'https://www.myjudo.eu/interface/';
-            } else {
-                if (this.config.ip === undefined) {
-                    this.log.error(`IP undefined`);
-                    return;
-                }
-                baseUrl = `https://${this.config.ip}:8124/?group=`;
-            }
-
-            this.log.debug(`base url ${baseUrl}`);
-
-            if (this.config.user === undefined) {
-                this.log.debug(`user undefined`);
-                return;
-            }
-
-            try {
-                _interval = parseInt(this.config.interval * 1000, 10);
-            } catch {
-                _interval = 600000;
-            }
-        } catch {
-            this.log.error('other problem');
-        }
     }
 }
+
 // @ts-expect-error parent is a valid property on module
 if (module.parent) {
-    // Export the constructor in compact mode
-    /**
-     * @param {Partial<utils.AdapterOptions>} [options] - Adapter initialization options.
-     */
-    module.exports = options => new judoisoftControll(options);
+    /** @param {Partial<utils.AdapterOptions>} [options] - Adapter initialization options. */
+    module.exports = options => new Judoisoft(options);
 } else {
-    // otherwise start the instance directly
-    new judoisoftControll();
+    new Judoisoft();
 }
