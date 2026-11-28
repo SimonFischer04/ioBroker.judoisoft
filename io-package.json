@@ -109,6 +109,10 @@
     "type": "household",
     "singletonHost": false,
     "logTransporter": true,
+    "messagebox": true,
+    "supportedMessages": {
+      "help": true
+    },
     "connectionType": "local",
     "dataSource": "push",
     "globalDependencies": [
@@ -153,6 +157,7 @@
       "common": {
         "role": "indicator.connected",
         "name": "If connected",
+        "desc": "Whether the adapter is communicating in the configured connection mode.",
         "type": "boolean",
         "read": true,
         "write": false,

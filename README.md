@@ -25,6 +25,19 @@ This uses the local interface `http://<ip>/api/rest/...` (Basic Auth).
 
 Cloud login takes precedence: when it is enabled, the REST API option is hidden and ignored.
 
+### MCP and agent help
+
+The adapter advertises `common.supportedMessages.help`. Agents such as pi-agent can use `adapter_help` to discover the
+instance's telemetry and controls for its configured connection mode. Scripts can query the same help over the
+ioBroker message bus. Replace `judoisoft.0` with the instance you want to query.
+
+```javascript
+sendTo('judoisoft.0', 'help', {}, response => log(response.help));
+```
+
+The read-only reply contains a `help` string and a `commands` array with `{ command: 'help', write: false }`.
+Device controls use state writes with `ack: false`.
+
 ## Changelog
 ### 1.1.7 (2026-09-09)
 - try fix release

@@ -1,6 +1,7 @@
 'use strict';
 
 const judoConv = require('./lib/dataConverter');
+const { getAdapterHelp } = require('./lib/help');
 const restData = require('./lib/restData');
 const utils = require('@iobroker/adapter-core');
 const axios = require('axios');
@@ -48,7 +49,7 @@ class judoisoftControll extends utils.Adapter {
         this.on('ready', this.onReady.bind(this));
         //this.on('objectChange', this.onObjectChange.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
-        //  this.on('message', this.onMessage.bind(this));
+        this.on('message', this.onMessage.bind(this));
         this.on('unload', this.onUnload.bind(this));
     }
 
@@ -125,6 +126,18 @@ class judoisoftControll extends utils.Adapter {
         } else {
             // The state was deleted
             this.log.info(`state ${id} deleted`);
+        }
+    }
+
+    /**
+     * Replies to help requests on the ioBroker message bus.
+     *
+     * @param {ioBroker.Message} message - The incoming message.
+     */
+    onMessage(message) {
+        if (message?.command === 'help' && message.callback) {
+            const mode = this.isRestApiMode() ? 'rest' : this.isCloudMode() ? 'cloud' : 'local';
+            this.sendTo(message.from, message.command, getAdapterHelp(this.namespace, mode), message.callback);
         }
     }
 
